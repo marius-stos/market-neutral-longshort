@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data & cache (large files, regenerated automatically)
+output/price_cache.parquet
+output/edgar_cache/
+output/merger_cache/
+output/*.parquet
+
+# Keep output JSON results (small, useful to track)
+!output/walkforward_results.json
+!output/live_signals.json
+!output/deals.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+/tmp/
+
+# IDE
+.vscode/
+.idea/
+*.swp
