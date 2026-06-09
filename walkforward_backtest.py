@@ -1,14 +1,16 @@
 """
-Global Momentum Market-Neutral Backtest  — Phase 1 (realistic costs)
-=====================================================================
-Universe  : ~580 global stocks (US S&P 500 + EU/Asia ADRs)
-Signal    : Sector-relative momentum (JT 12-1m + 6-1m + 3-1m + 52-wk-high)
-Portfolio : Top-40 long / Bottom-40 short, inverse-vol weighted
-Costs     : Differentiated slippage (8 bps US / 15 bps ADR) +
-            Borrow costs (0.5 %/yr US / 1.5 %/yr ADR) on short leg
-Rebalance : Monthly (1st trading day of each month)
-PnL       : Vectorised — no stop-losses, holds constant within each period
-Output    : output/walkforward_results.json  (Dash-compatible)
+Global Momentum Market-Neutral Backtest  — Phase 2 (enhanced signals)
+======================================================================
+Universe   : ~580 global stocks (US S&P 500 + EU/Asia ADRs)
+Signal     : Residual momentum + IVOL + 52-wk-high (sector-relative, market-adjusted)
+Portfolio  : 39L / 39S — overlapping sub-portfolios (3×13, held 3 months each)
+             Conviction-scaled weights (|signal| × 1/vol)
+Costs      : Differentiated slippage (8 bps US / 15 bps ADR) +
+             Borrow costs (0.5 %/yr US / 1.5 %/yr ADR) on short leg
+Rebalance  : Monthly — 1/3 of portfolio rotated each month (turnover ≈30%/yr)
+Regime     : SPY drawdown + 1m return + vol filter → gross multiplier [0.5, 1.0]
+Earnings   : Positions within 7 days of earnings halved (blackout filter)
+Output     : output/walkforward_results.json  (Dash-compatible)
 """
 
 from __future__ import annotations
@@ -51,9 +53,19 @@ logger = logging.getLogger(__name__)
 OUTPUT_DIR   = Path("output")
 BENCHMARK    = "SPY"
 
-N_LONG       = 40      # long positions per rebal
-N_SHORT      = 40      # short positions per rebal
+N_LONG       = 39      # total longs (3 sub-portfolios × 13)
+N_SHORT      = 39      # total shorts (3 sub-portfolios × 13)
 GROSS        = 1.0     # total gross (0.5 each leg)
+
+# ── Overlapping sub-portfolios (improvement #1 — cut turnover ≈70%) ───────────
+HOLD_PERIODS = 3       # months each sub-portfolio is held
+N_SUB_LONG   = N_LONG  // HOLD_PERIODS   # 13 new longs added per month
+N_SUB_SHORT  = N_SHORT // HOLD_PERIODS   # 13 new shorts added per month
+
+# ── Earnings blackout (improvement #4) ────────────────────────────────────────
+USE_EARNINGS_FILTER = True   # halve weight for positions within 7 days of earnings
+EARNINGS_WINDOW_DAYS = 7     # days before/after earnings to reduce exposure
+EARNINGS_WEIGHT_MULT = 0.50  # weight multiplier during blackout
 
 MIN_HISTORY  = 252     # trading days needed before first rebal
 MIN_VALID_PX = 200     # min non-NaN price days to include a ticker
@@ -189,6 +201,146 @@ def _rank(s: pd.Series) -> pd.Series:
     return (r - 0.5).fillna(0.0)
 
 
+# ---------------------------------------------------------------------------
+# New signal helpers (Phase 2)
+# ---------------------------------------------------------------------------
+
+def compute_ivol(
+    prices: pd.DataFrame,
+    tickers: List[str],
+    spy_col: str = BENCHMARK,
+    window: int = 63,
+) -> pd.Series:
+    """
+    Idiosyncratic volatility = annualised std of CAPM residuals over `window` days.
+    High IVOL predicts LOWER future returns (Ang et al. 2006) → negative alpha signal.
+    """
+    ivol = pd.Series(0.20, index=tickers)
+    if spy_col not in prices.columns or len(prices) < window + 5:
+        return ivol
+    rets = prices.pct_change().iloc[-window:].dropna(how="all")
+    spy_r = rets[spy_col].dropna()
+    spy_var = float(spy_r.var())
+    if spy_var < 1e-10:
+        return ivol
+    for t in tickers:
+        if t not in rets.columns:
+            continue
+        r = rets[t].dropna()
+        sp = spy_r.reindex(r.index).dropna()
+        r, sp = r.align(sp, join="inner")
+        if len(r) < 30:
+            continue
+        beta_t = float(np.cov(r.values, sp.values)[0, 1] / spy_var)
+        resid  = r.values - beta_t * sp.values
+        ivol[t] = float(resid.std() * np.sqrt(252))
+    return ivol.clip(lower=0.03)
+
+
+def compute_residual_momentum(
+    prices: pd.DataFrame,
+    tickers: List[str],
+    spy_col: str = BENCHMARK,
+    lookback: int = 252,
+    skip: int = 21,
+) -> pd.Series:
+    """
+    Market-adjusted (residual) 12-1 month momentum.
+    Each stock's cumulative excess return over the market's own contribution.
+    Eliminates the systematic beta-return component so the ranking reflects
+    pure stock-specific momentum, not sector/factor rotation.
+    """
+    resid_mom = pd.Series(np.nan, index=tickers)
+    if spy_col not in prices.columns or len(prices) < lookback + skip + 5:
+        return resid_mom
+    rets = prices.pct_change().dropna(how="all")
+    spy_r = rets[spy_col]
+
+    # Beta estimated on first half of window to avoid lookahead in signal
+    beta_window = lookback // 2
+    for t in tickers:
+        if t not in rets.columns:
+            continue
+        r = rets[t]
+        # Beta from t-252 to t-126
+        r_beta = r.iloc[-(lookback):-beta_window].dropna()
+        sp_beta = spy_r.reindex(r_beta.index).dropna()
+        r_beta, sp_beta = r_beta.align(sp_beta, join="inner")
+        if len(r_beta) < 40:
+            continue
+        beta_t = float(np.cov(r_beta.values, sp_beta.values)[0, 1] /
+                       max(sp_beta.var(), 1e-10))
+        beta_t = float(np.clip(beta_t, -2.0, 3.0))
+
+        # Residual cumulative return from t-252 to t-21 (skip last month)
+        r_signal = r.iloc[-(lookback):-skip].dropna()
+        sp_signal = spy_r.reindex(r_signal.index).dropna()
+        r_signal, sp_signal = r_signal.align(sp_signal, join="inner")
+        if len(r_signal) < 60:
+            continue
+        excess = r_signal.values - beta_t * sp_signal.values
+        resid_mom[t] = float(excess.sum())   # cumulative residual return
+    return resid_mom
+
+
+def preload_earnings_calendar(
+    tickers: List[str],
+    cache_path: Optional[Path] = None,
+    force_refresh: bool = False,
+) -> Dict[str, List[pd.Timestamp]]:
+    """
+    Fetch upcoming + recent earnings dates for all tickers (cached to disk).
+    Gracefully skips tickers where yfinance has no data.
+    """
+    if cache_path is None:
+        cache_path = OUTPUT_DIR / "earnings_calendar.json"
+
+    if not force_refresh and cache_path.exists():
+        age = (datetime.now() - datetime.fromtimestamp(cache_path.stat().st_mtime)).days
+        if age < 7:
+            raw = json.loads(cache_path.read_text())
+            cal: Dict[str, List[pd.Timestamp]] = {}
+            for t, dates in raw.items():
+                cal[t] = [pd.Timestamp(d) for d in dates]
+            logger.info("Earnings calendar from cache (%d tickers)", len(cal))
+            return cal
+
+    logger.info("Fetching earnings calendar for %d tickers …", len(tickers))
+    cal = {}
+    for i, t in enumerate(tickers):
+        try:
+            ed = yf.Ticker(t).earnings_dates
+            if ed is not None and not ed.empty:
+                cal[t] = [ts for ts in ed.index if isinstance(ts, pd.Timestamp)]
+        except Exception:
+            pass
+        if i % 100 == 99:
+            logger.info("  Earnings: %d / %d", i + 1, len(tickers))
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(json.dumps(
+        {t: [str(d) for d in dates] for t, dates in cal.items()}
+    ))
+    logger.info("Earnings calendar saved (%d tickers with data)", len(cal))
+    return cal
+
+
+def get_earnings_risk_tickers(
+    tickers: List[str],
+    calendar: Dict[str, List[pd.Timestamp]],
+    check_date: pd.Timestamp,
+    window: int = EARNINGS_WINDOW_DAYS,
+) -> set:
+    """Return tickers whose nearest earnings date is within `window` days of check_date."""
+    risky: set = set()
+    for t in tickers:
+        for earn_d in calendar.get(t, []):
+            if abs((earn_d - check_date).days) <= window:
+                risky.add(t)
+                break
+    return risky
+
+
 def _sector_relative(series: pd.Series, avail: List[str],
                      sector_map: Dict[str, str]) -> pd.Series:
     """
@@ -274,12 +426,28 @@ def compute_factors(
     sr_3_1  = _sector_relative(mom_3_1,  avail, sector_map)
     sr_n52  = _sector_relative(near52,   avail, sector_map)
 
-    # ── Composite: global rank of sector-relative signals ────────────────
+    # ── Residual momentum (improvement #2 — market-adjusted) ─────────────
+    # Removes the market beta component from the 12-1m momentum signal.
+    # Pure stock-selection alpha — sector rotation noise already stripped.
+    resid_mom = compute_residual_momentum(prices, avail, BENCHMARK)
+    sr_resid  = _sector_relative(resid_mom, avail, sector_map)
+
+    # ── Idiosyncratic volatility (improvement #3 — IVOL short signal) ────
+    # High IVOL stocks underperform (Ang et al. 2006).
+    # Subtracted from composite → pushes high-IVOL into short pool.
+    ivol_raw = compute_ivol(prices, avail, BENCHMARK)
+
+    # ── Composite: global rank of sector-relative signals ─────────────────
+    # Weights rebalanced vs Phase 1:
+    #   raw 12-1m reduced (0.45→0.30), residual mom added (0.20),
+    #   IVOL subtracted (0.10), 52wk-high kept (0.25), 6-1m/3-1m trimmed
     momentum = (
-        _rank(sr_12_1) * 0.45
-        + _rank(sr_6_1)  * 0.20
-        + _rank(sr_3_1)  * 0.10
-        + _rank(sr_n52)  * 0.25
+        _rank(sr_12_1)   * 0.30   # raw 12-1m (sector-relative)
+        + _rank(sr_resid)* 0.20   # market-adjusted residual momentum
+        + _rank(sr_6_1)  * 0.15   # 6-1m
+        + _rank(sr_3_1)  * 0.10   # 3-1m
+        + _rank(sr_n52)  * 0.25   # nearness to 52-wk high
+        - _rank(ivol_raw)* 0.10   # IVOL penalty (high IVOL → lower rank)
     )
 
     # ── PIT fundamental blend (EDGAR, US stocks only) ────────────────────
@@ -327,13 +495,15 @@ def compute_factors(
         composite = momentum
 
     return pd.DataFrame({
-        "composite": composite,
-        "quality":   quality,
-        "value":     value,
-        "momentum":  momentum,
-        "rvol":      rvol,
-        "mom_12_1":  mom_12_1,
-        "near52":    near52.reindex(avail).fillna(0.5),
+        "composite":  composite,
+        "quality":    quality,
+        "value":      value,
+        "momentum":   momentum,
+        "rvol":       rvol,
+        "ivol":       ivol_raw.reindex(avail).fillna(0.20),
+        "resid_mom":  resid_mom.reindex(avail).fillna(0.0),
+        "mom_12_1":   mom_12_1,
+        "near52":     near52.reindex(avail).fillna(0.5),
     }).reindex(avail)
 
 
@@ -395,6 +565,27 @@ def _vol_weight(tickers: List[str], rvol: pd.Series, gross: float) -> pd.Series:
     return (inv / inv.sum()) * gross
 
 
+def _conviction_vol_weight(
+    tickers: List[str],
+    composite: pd.Series,
+    rvol: pd.Series,
+    gross: float,
+    conviction_power: float = 0.5,
+) -> pd.Series:
+    """
+    Improvement #5 — signal × (1/vol) weighting.
+    Weight = |composite|^conviction_power / rvol, normalised.
+    conviction_power=0.5 gives a smooth tilt toward higher-signal names
+    without concentrating too much in a handful of extreme scores.
+    """
+    if not tickers:
+        return pd.Series(dtype=float)
+    rv   = rvol.reindex(tickers).fillna(0.20).clip(lower=0.05)
+    sig  = composite.reindex(tickers).abs().clip(lower=0.05).fillna(0.05)
+    w    = (sig ** conviction_power) / rv
+    return (w / w.sum()) * gross
+
+
 def _sector_relative_composite(
     composite: pd.Series,
     sector_map: Dict[str, str],
@@ -426,15 +617,20 @@ def build_portfolio(
     factors: pd.DataFrame,
     sector_map: Dict[str, str],
     betas: pd.Series,
+    n_long: int = N_SUB_LONG,
+    n_short: int = N_SUB_SHORT,
+    gross_per_leg: float = GROSS / 2.0 / HOLD_PERIODS,
+    exclude_tickers: Optional[set] = None,
 ) -> pd.DataFrame:
     """
     Return DataFrame(ticker, direction, weight, composite, rvol, beta).
     Long  = top-N by sector-blended composite.
     Short = bottom-N filtered: exclude deep-drawdown stocks (>35% from 52wk high)
             that are prone to mean-reversion / value bounce.
-    Equal gross on both legs (no beta rescaling — see comment below).
+    Weights = conviction × (1/vol), scaled to gross_per_leg.
+    exclude_tickers: already-selected tickers (for sub-portfolio diversification).
     """
-    gross_per_leg = GROSS / 2.0
+    exclude_tickers = exclude_tickers or set()
 
     raw_comp = factors["composite"].dropna()
     raw_comp = raw_comp[raw_comp.index != BENCHMARK]
@@ -444,9 +640,13 @@ def build_portfolio(
     comp = comp.sort_values(ascending=False)
     rvol = factors["rvol"]
 
+    # Exclude already-selected tickers (from other active sub-portfolios)
+    if exclude_tickers:
+        comp = comp[~comp.index.isin(exclude_tickers)]
+
     # ── Longs: top composite (sector-diversified) ─────────────────────────
-    long_pool  = comp.head(N_LONG * 3)
-    long_picks = _sector_diversify(long_pool, N_LONG, sector_map)
+    long_pool  = comp.head(n_long * 3)
+    long_picks = _sector_diversify(long_pool, n_long, sector_map)
 
     # ── Shorts: bottom composite, with quality filter ─────────────────────
     # Exclude deep-drawdown stocks (>35% below 52-wk high) — these are
@@ -455,7 +655,7 @@ def build_portfolio(
     near52   = factors["near52"]   if "near52"   in factors.columns else pd.Series(0.5, index=comp.index)
     mom_12_1 = factors["mom_12_1"] if "mom_12_1" in factors.columns else pd.Series(0.0, index=comp.index)
 
-    short_pool_raw = comp.tail(N_SHORT * 3).iloc[::-1]   # worst composite first
+    short_pool_raw = comp.tail(n_short * 3).iloc[::-1]   # worst composite first
     # Filter: not too deep in drawdown, and actually declining
     not_crashed = near52.reindex(short_pool_raw.index).fillna(0.5) >= 0.62   # at most 38% below 52-wk high
     declining   = mom_12_1.reindex(short_pool_raw.index).fillna(0.0) <= 0.10  # not strongly rising
@@ -469,14 +669,16 @@ def build_portfolio(
     if short_pool.empty:
         short_pool = short_pool_raw   # no filter as last resort
 
-    short_picks = _sector_diversify(short_pool, N_SHORT, sector_map)
-    short_picks = [t for t in short_picks if t not in long_picks][:N_SHORT]
+    short_picks = _sector_diversify(short_pool, n_short, sector_map)
+    short_picks = [t for t in short_picks if t not in long_picks][:n_short]
 
     if not long_picks:
         return pd.DataFrame()
 
-    long_w  = _vol_weight(long_picks,  rvol, gross_per_leg)
-    short_w = _vol_weight(short_picks, rvol, gross_per_leg)
+    # ── Conviction-scaled weights (improvement #5) ────────────────────────
+    composite_col = factors["composite"]
+    long_w  = _conviction_vol_weight(long_picks,  composite_col, rvol, gross_per_leg)
+    short_w = _conviction_vol_weight(short_picks, composite_col, rvol, gross_per_leg)
 
     # Equal-gross legs: no beta rescaling.
     # Beta neutralisation was counterproductive: momentum longs (tech/growth β≈1.3)
@@ -518,9 +720,12 @@ def compute_period_pnl(
     start: pd.Timestamp,
     end: pd.Timestamp,
     sector_map: Dict[str, str],
+    apply_slippage: bool = True,
 ) -> Tuple[pd.Series, List[Dict]]:
     """
     Hold portfolio weights constant from start to end.
+    apply_slippage: False for continuation months of an overlapping sub-portfolio
+                    (slippage charged only once at entry, not every month).
     Returns (daily_returns Series, trades list for analytics).
     """
     period = prices.loc[start:end]
@@ -543,13 +748,13 @@ def compute_period_pnl(
     signed_w = (signs * weights).reindex(avail)
     port_ret  = daily.multiply(signed_w, axis=1).sum(axis=1)
 
-    # ── Differentiated one-way slippage on entry ──────────────────────────
-    # US large caps: 8 bps; international ADRs: 15 bps (wider spreads)
-    slip_cost = sum(
-        w * (SLIP_INTL_BPS if t in INTL_TICKERS else SLIP_US_BPS) / 10_000.0
-        for t, w in weights.items()
-    )
-    port_ret.iloc[0] -= slip_cost
+    # ── Differentiated one-way slippage on entry (only at portfolio inception) ─
+    if apply_slippage:
+        slip_cost = sum(
+            w * (SLIP_INTL_BPS if t in INTL_TICKERS else SLIP_US_BPS) / 10_000.0
+            for t, w in weights.items()
+        )
+        port_ret.iloc[0] -= slip_cost
 
     # ── Daily borrow cost on short positions ─────────────────────────────
     # Applied each day as a drag: US 0.5%/yr, ADRs 1.5%/yr
@@ -646,20 +851,62 @@ def compute_metrics(
 # ---------------------------------------------------------------------------
 
 def detect_regime(spy_prices: pd.Series) -> Dict:
-    """SMA-200 based regime. Returns gross multiplier."""
+    """
+    Improvement #6 — multi-signal regime filter.
+    Combines three orthogonal signals:
+      1. Trend    : SMA-200 relative position
+      2. Momentum : 1-month market return (momentum crash early warning)
+      3. Vol      : 21-day realised vol vs 63-day baseline (stress indicator)
+    Returns a gross multiplier in [0.50, 1.0].
+    """
     if len(spy_prices) < 200:
-        return {"label": "Choppy", "gross_mult": 0.8}
-    sma200 = spy_prices.rolling(200).mean()
-    last   = float(spy_prices.iloc[-1])
-    sma    = float(sma200.iloc[-1])
-    sma50  = float(spy_prices.rolling(50).mean().iloc[-1])
+        return {"label": "Unknown", "gross_mult": 0.80}
 
-    if last > sma200.iloc[-1] and sma50 > sma:
-        return {"label": "Bull",   "gross_mult": 1.0}
-    elif last < sma200.iloc[-1] * 0.95:
-        return {"label": "Bear",   "gross_mult": 0.7}
+    last    = float(spy_prices.iloc[-1])
+    sma200  = float(spy_prices.rolling(200).mean().iloc[-1])
+    sma50   = float(spy_prices.rolling(50).mean().iloc[-1])
+
+    # 1. Drawdown from 3-month peak (momentum crash signal)
+    peak_3m = float(spy_prices.iloc[-63:].max())
+    dd_3m   = (last / peak_3m) - 1   # negative number
+
+    # 2. 1-month return
+    ret_1m  = (last / float(spy_prices.iloc[-21])) - 1
+
+    # 3. Volatility ratio (current 21d vol / trailing 63d vol)
+    rets = spy_prices.pct_change().dropna()
+    vol_21 = float(rets.iloc[-21:].std() * np.sqrt(252)) if len(rets) >= 21 else 0.15
+    vol_63 = float(rets.iloc[-63:].std() * np.sqrt(252)) if len(rets) >= 63 else 0.15
+    vol_ratio = vol_21 / max(vol_63, 0.01)
+
+    # --- Score each dimension ---
+    trend_bull  = last > sma200 and sma50 > sma200
+    trend_bear  = last < sma200 * 0.97
+
+    crash_risk  = dd_3m < -0.10 or ret_1m < -0.06   # market falling fast
+    vol_stress  = vol_ratio > 1.5                     # vol spiking
+
+    # --- Determine regime and multiplier ---
+    if trend_bear or (crash_risk and vol_stress):
+        label = "Bear"
+        mult  = 0.50   # significant de-gross; momentum crashes hardest in reversals
+    elif crash_risk or vol_stress:
+        label = "Caution"
+        mult  = 0.70
+    elif trend_bull and not crash_risk and not vol_stress:
+        label = "Bull"
+        mult  = 1.00
     else:
-        return {"label": "Choppy", "gross_mult": 0.85}
+        label = "Choppy"
+        mult  = 0.85
+
+    return {
+        "label":      label,
+        "gross_mult": mult,
+        "dd_3m":      round(dd_3m,   3),
+        "ret_1m":     round(ret_1m,  3),
+        "vol_ratio":  round(vol_ratio, 2),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -721,6 +968,14 @@ def run_walkforward(start_year: int = 2019, force_refresh: bool = False) -> Dict
     else:
         logger.info("EDGAR disabled — using sector-relative momentum only")
 
+    # ── Earnings calendar (improvement #4) ───────────────────────────────
+    earnings_cal: Dict[str, List[pd.Timestamp]] = {}
+    if USE_EARNINGS_FILTER:
+        try:
+            earnings_cal = preload_earnings_calendar(universe, force_refresh=force_refresh)
+        except Exception as exc:
+            logger.warning("Earnings calendar load failed (%s) — skipping filter", exc)
+
     # ── Walk-forward state ────────────────────────────────────────────────
     all_daily:     pd.Series  = pd.Series(dtype=float)
     bench_daily:   pd.Series  = pd.Series(dtype=float)
@@ -728,6 +983,10 @@ def run_walkforward(start_year: int = 2019, force_refresh: bool = False) -> Dict
     rebal_history: List[Dict] = []
     long_daily:    pd.Series  = pd.Series(dtype=float)
     short_daily:   pd.Series  = pd.Series(dtype=float)
+
+    # ── Overlapping sub-portfolio bag (improvement #1) ───────────────────
+    # Each entry: (portfolio_df, start_date, periods_remaining)
+    active_subs: List[Tuple[pd.DataFrame, pd.Timestamp, int]] = []
 
     for i, rdate in enumerate(rebal_dates):
         prices_so_far = prices.loc[:rdate]
@@ -760,38 +1019,89 @@ def run_walkforward(start_year: int = 2019, force_refresh: bool = False) -> Dict
         # ── Betas ────────────────────────────────────────────────────────
         betas = compute_betas(prices_so_far, universe)
 
-        # ── Portfolio ────────────────────────────────────────────────────
-        try:
-            portfolio = build_portfolio(factors, sector_map, betas)
-            if portfolio.empty:
-                continue
-        except Exception as e:
-            logger.error("Portfolio build failed at %s: %s", rdate.date(), e)
-            continue
+        # ── Overlapping portfolios: build new sub-portfolio ──────────────
+        # Collect tickers already in active sub-portfolios to diversify picks
+        already_selected = set(
+            t for sub_p, _, _ in active_subs
+            for t in sub_p.index.tolist()
+        )
 
-        # Apply regime gross multiplier
-        portfolio["weight"] = portfolio["weight"] * gross_mult
-
-        # ── P&L ──────────────────────────────────────────────────────────
         try:
-            period_ret, period_trades = compute_period_pnl(
-                portfolio, prices, rdate, next_rdate, sector_map
+            new_sub = build_portfolio(
+                factors, sector_map, betas,
+                n_long=N_SUB_LONG, n_short=N_SUB_SHORT,
+                gross_per_leg=GROSS / 2.0 / HOLD_PERIODS * gross_mult,
+                exclude_tickers=already_selected,
             )
         except Exception as e:
-            logger.error("PnL failed at %s: %s", rdate.date(), e)
+            logger.error("Portfolio build failed at %s: %s", rdate.date(), e)
+            new_sub = pd.DataFrame()
+
+        if not new_sub.empty:
+            # ── Earnings blackout (improvement #4) ───────────────────────
+            if USE_EARNINGS_FILTER and earnings_cal:
+                risky = get_earnings_risk_tickers(
+                    new_sub.index.tolist(), earnings_cal, rdate
+                )
+                if risky:
+                    new_sub.loc[new_sub.index.isin(risky), "weight"] *= EARNINGS_WEIGHT_MULT
+                    logger.debug("Earnings blackout: %d tickers halved at %s", len(risky), rdate.date())
+
+            active_subs.append((new_sub, rdate, HOLD_PERIODS))
+
+        # Age all subs, remove expired
+        active_subs = [(p, s, pr - 1) for p, s, pr in active_subs if pr > 0]
+
+        if not active_subs:
             continue
+
+        # ── P&L for this month = SUM over all active sub-portfolios ──────
+        # Slippage only charged in the sub's entry month (apply_slippage = start==rdate)
+        period_ret   = pd.Series(dtype=float)
+        period_trades: List[Dict] = []
+        lp_ret_parts: List[pd.Series] = []
+        sp_ret_parts: List[pd.Series] = []
+
+        for sub_p, sub_start, _ in active_subs:
+            is_entry = (sub_start == rdate)
+            try:
+                sr, st = compute_period_pnl(
+                    sub_p, prices, rdate, next_rdate, sector_map,
+                    apply_slippage=is_entry,
+                )
+            except Exception as e:
+                logger.error("PnL failed at %s: %s", rdate.date(), e)
+                continue
+            if sr.empty:
+                continue
+            period_ret = sr if period_ret.empty else period_ret.add(sr, fill_value=0.0)
+            period_trades.extend(st)
+
+            # Long/short attribution per sub
+            try:
+                lp, _ = compute_period_pnl(
+                    sub_p[sub_p["direction"] == "LONG"],
+                    prices, rdate, next_rdate, sector_map, apply_slippage=False,
+                )
+                sp, _ = compute_period_pnl(
+                    sub_p[sub_p["direction"] == "SHORT"],
+                    prices, rdate, next_rdate, sector_map, apply_slippage=False,
+                )
+                lp_ret_parts.append(lp)
+                sp_ret_parts.append(sp)
+            except Exception:
+                pass
 
         if period_ret.empty:
             continue
 
-        # Long / Short attribution
-        long_port  = portfolio[portfolio["direction"] == "LONG"]
-        short_port = portfolio[portfolio["direction"] == "SHORT"]
-        try:
-            lp_ret, _ = compute_period_pnl(long_port,  prices, rdate, next_rdate, sector_map)
-            sp_ret, _ = compute_period_pnl(short_port, prices, rdate, next_rdate, sector_map)
-        except Exception:
-            lp_ret = sp_ret = pd.Series(0.0, index=period_ret.index)
+        # Aggregate long/short attribution
+        lp_ret = pd.Series(0.0, index=period_ret.index)
+        sp_ret = pd.Series(0.0, index=period_ret.index)
+        for s in lp_ret_parts:
+            lp_ret = lp_ret.add(s.reindex(lp_ret.index).fillna(0), fill_value=0)
+        for s in sp_ret_parts:
+            sp_ret = sp_ret.add(s.reindex(sp_ret.index).fillna(0), fill_value=0)
 
         all_daily   = pd.concat([all_daily,   period_ret])
         long_daily  = pd.concat([long_daily,  lp_ret])
@@ -803,24 +1113,32 @@ def run_walkforward(start_year: int = 2019, force_refresh: bool = False) -> Dict
             bm = prices[BENCHMARK].pct_change().loc[rdate:next_rdate]
             bench_daily = pd.concat([bench_daily, bm])
 
-        n_long  = (portfolio["direction"] == "LONG").sum()
-        n_short = (portfolio["direction"] == "SHORT").sum()
-        cum_val = float((1 + all_daily).prod())
+        # Combined portfolio stats for logging
+        combined_portfolio = pd.concat([p for p, _, _ in active_subs])
+        n_long_tot  = (combined_portfolio["direction"] == "LONG").sum()
+        n_short_tot = (combined_portfolio["direction"] == "SHORT").sum()
+        gross_tot   = float(combined_portfolio["weight"].abs().sum())
+        cum_val     = float((1 + all_daily).prod()) if not all_daily.empty else 1.0
+
         logger.info(
-            "[%s] regime=%-6s nL=%d nS=%d gross=%.2f cum=%.4f",
-            rdate.date(), regime["label"], n_long, n_short,
-            portfolio["weight"].abs().sum(), cum_val
+            "[%s] regime=%-7s nL=%d nS=%d gross=%.2f cum=%.4f  dd3m=%.1f%% vol_ratio=%.1f",
+            rdate.date(), regime["label"], n_long_tot, n_short_tot, gross_tot, cum_val,
+            regime.get("dd_3m", 0) * 100, regime.get("vol_ratio", 1.0),
         )
 
-        # Top longs / shorts for history
-        top_longs  = portfolio[portfolio["direction"] == "LONG"]["composite"].nlargest(5).index.tolist()
-        top_shorts = portfolio[portfolio["direction"] == "SHORT"]["composite"].nsmallest(5).index.tolist()
+        # Newest sub's top picks for history
+        if not new_sub.empty:
+            top_longs  = new_sub[new_sub["direction"] == "LONG"]["composite"].nlargest(5).index.tolist()
+            top_shorts = new_sub[new_sub["direction"] == "SHORT"]["composite"].nsmallest(5).index.tolist()
+        else:
+            top_longs, top_shorts = [], []
+
         rebal_history.append({
             "date":        str(rdate.date()),
             "regime":      regime["label"],
-            "n_long":      int(n_long),
-            "n_short":     int(n_short),
-            "gross":       round(float(portfolio["weight"].abs().sum()), 3),
+            "n_long":      int(n_long_tot),
+            "n_short":     int(n_short_tot),
+            "gross":       round(gross_tot, 3),
             "top_longs":   top_longs,
             "top_shorts":  top_shorts,
         })
