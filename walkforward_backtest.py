@@ -332,10 +332,14 @@ def get_earnings_risk_tickers(
     window: int = EARNINGS_WINDOW_DAYS,
 ) -> set:
     """Return tickers whose nearest earnings date is within `window` days of check_date."""
+    # Normalise check_date to tz-naive so it's comparable with both tz-aware
+    # and tz-naive timestamps returned by yfinance.
+    check_naive = check_date.tz_localize(None) if check_date.tzinfo else check_date
     risky: set = set()
     for t in tickers:
         for earn_d in calendar.get(t, []):
-            if abs((earn_d - check_date).days) <= window:
+            earn_naive = earn_d.tz_localize(None) if earn_d.tzinfo else earn_d
+            if abs((earn_naive - check_naive).days) <= window:
                 risky.add(t)
                 break
     return risky
