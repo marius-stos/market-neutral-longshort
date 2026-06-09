@@ -432,26 +432,23 @@ def compute_factors(
 
     # ── Residual momentum (improvement #2 — market-adjusted) ─────────────
     # Removes the market beta component from the 12-1m momentum signal.
-    # Pure stock-selection alpha — sector rotation noise already stripped.
+    # Weight kept modest (0.10) so core signal dominates.
     resid_mom = compute_residual_momentum(prices, avail, BENCHMARK)
     sr_resid  = _sector_relative(resid_mom, avail, sector_map)
 
     # ── Idiosyncratic volatility (improvement #3 — IVOL short signal) ────
     # High IVOL stocks underperform (Ang et al. 2006).
-    # Subtracted from composite → pushes high-IVOL into short pool.
+    # Small penalty weight (0.05) to nudge rather than override.
     ivol_raw = compute_ivol(prices, avail, BENCHMARK)
 
-    # ── Composite: global rank of sector-relative signals ─────────────────
-    # Weights rebalanced vs Phase 1:
-    #   raw 12-1m reduced (0.45→0.30), residual mom added (0.20),
-    #   IVOL subtracted (0.10), 52wk-high kept (0.25), 6-1m/3-1m trimmed
+    # ── Composite: sector-relative signals, Phase-1 calibrated + residual ─
     momentum = (
-        _rank(sr_12_1)   * 0.30   # raw 12-1m (sector-relative)
-        + _rank(sr_resid)* 0.20   # market-adjusted residual momentum
-        + _rank(sr_6_1)  * 0.15   # 6-1m
+        _rank(sr_12_1)   * 0.40   # core 12-1m momentum (dominant signal)
+        + _rank(sr_resid)* 0.10   # market-adjusted residual (modest boost)
+        + _rank(sr_6_1)  * 0.18   # 6-1m
         + _rank(sr_3_1)  * 0.10   # 3-1m
-        + _rank(sr_n52)  * 0.25   # nearness to 52-wk high
-        - _rank(ivol_raw)* 0.10   # IVOL penalty (high IVOL → lower rank)
+        + _rank(sr_n52)  * 0.22   # nearness to 52-wk high
+        - _rank(ivol_raw)* 0.05   # small IVOL penalty
     )
 
     # ── PIT fundamental blend (EDGAR, US stocks only) ────────────────────
@@ -1034,8 +1031,9 @@ def run_walkforward(start_year: int = 2019, force_refresh: bool = False) -> Dict
             new_sub = build_portfolio(
                 factors, sector_map, betas,
                 n_long=N_SUB_LONG, n_short=N_SUB_SHORT,
-                gross_per_leg=GROSS / 2.0 / HOLD_PERIODS * gross_mult,
-                exclude_tickers=already_selected,
+                gross_per_leg=GROSS / 2.0 / HOLD_PERIODS,
+                # No exclude_tickers: each sub picks independently from full universe.
+                # Overlapping picks are fine — persistent winners naturally get overweight.
             )
         except Exception as e:
             logger.error("Portfolio build failed at %s: %s", rdate.date(), e)
@@ -1068,9 +1066,14 @@ def run_walkforward(start_year: int = 2019, force_refresh: bool = False) -> Dict
 
         for sub_p, sub_start, _ in active_subs:
             is_entry = (sub_start == rdate)
+            # Apply current regime multiplier to ALL active subs each month.
+            # This ensures the full portfolio de-grosses immediately in Bear/Caution,
+            # not just the 1/3 that happens to be newly built this month.
+            sub_p_regime = sub_p.copy()
+            sub_p_regime["weight"] = sub_p_regime["weight"] * gross_mult
             try:
                 sr, st = compute_period_pnl(
-                    sub_p, prices, rdate, next_rdate, sector_map,
+                    sub_p_regime, prices, rdate, next_rdate, sector_map,
                     apply_slippage=is_entry,
                 )
             except Exception as e:
@@ -1084,11 +1087,11 @@ def run_walkforward(start_year: int = 2019, force_refresh: bool = False) -> Dict
             # Long/short attribution per sub
             try:
                 lp, _ = compute_period_pnl(
-                    sub_p[sub_p["direction"] == "LONG"],
+                    sub_p_regime[sub_p_regime["direction"] == "LONG"],
                     prices, rdate, next_rdate, sector_map, apply_slippage=False,
                 )
                 sp, _ = compute_period_pnl(
-                    sub_p[sub_p["direction"] == "SHORT"],
+                    sub_p_regime[sub_p_regime["direction"] == "SHORT"],
                     prices, rdate, next_rdate, sector_map, apply_slippage=False,
                 )
                 lp_ret_parts.append(lp)
