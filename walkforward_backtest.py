@@ -60,7 +60,34 @@ GROSS        = 1.0     # total gross (0.5 each leg)
 # ── Overlapping sub-portfolios (improvement #1 — cut turnover ≈70%) ───────────
 HOLD_PERIODS = 3       # months each sub-portfolio is held
 N_SUB_LONG   = N_LONG  // HOLD_PERIODS   # 13 new longs added per month
-N_SUB_SHORT  = N_SHORT // HOLD_PERIODS   # 13 new shorts added per month
+N_SUB_SHORT  = N_SHORT // HOLD_PERIODS   # 10 new shorts added per month
+
+# ── Phase 3 improvement #1: dedicated short-alpha signal ──────────────────────
+# DISABLED: weighting shorts toward HIGH idiosyncratic vol backfired — high-IVOL
+# names squeeze hardest in rallies (junk/high-beta), worsening MaxDD −12%→−17%.
+# The IVOL anomaly only pays on the long side (avoid them), not as a short signal.
+# Reverted to Phase-2 composite-based short selection.
+USE_SHORT_SCORE = False
+W_SHORT_MOM   = 0.60
+W_SHORT_IVOL  = 0.40
+
+# ── Phase 3 improvement #2: short-term reversal sleeve ────────────────────────
+# DISABLED: a 1-month reversal signal decays within days/weeks, so holding it
+# across a 3-month overlapping window destroys the alpha and dilutes momentum.
+# Tested at weight 0.20 → long leg dropped +95%→+66%.  Kept off.
+USE_REVERSAL     = False
+REVERSAL_WEIGHT  = 0.0
+REVERSAL_LOOKBACK = 21
+
+# ── Phase 3 improvement #3: portfolio volatility CAP (de-lever only) ──────────
+# Scale the book DOWN when its trailing realised vol exceeds target, never up.
+# Levering up into calm periods (max>1) amplified 2022/2025 crashes, so the
+# scalar is capped at 1.0 — this is a pure risk cap, not a vol target.
+USE_VOL_TARGET = True
+VOL_TARGET     = 0.08    # 8% annualised cap
+VOL_LOOKBACK   = 42      # trailing days for realised-vol estimate
+VOL_SCALE_MIN  = 0.50    # de-lever down to at most 0.5×
+VOL_SCALE_MAX  = 1.00    # never lever above 1.0× (cap only)
 
 # ── Earnings blackout (improvement #4) ────────────────────────────────────────
 USE_EARNINGS_FILTER = True   # halve weight for positions within 7 days of earnings
@@ -441,7 +468,17 @@ def compute_factors(
     # Small penalty weight (0.05) to nudge rather than override.
     ivol_raw = compute_ivol(prices, avail, BENCHMARK)
 
-    # ── Composite: sector-relative signals, Phase-1 calibrated + residual ─
+    # ── Short-term reversal (Phase 3 #2) ─────────────────────────────────
+    # The skipped last-month return, sign-flipped: stocks that fell over the
+    # past month tend to bounce, recent winners tend to give back.
+    # Orthogonal to 12-1m momentum (which excludes this window by design).
+    reversal = pd.Series(0.0, index=avail)
+    if USE_REVERSAL and len(prices) >= REVERSAL_LOOKBACK + 1:
+        last_ret = prices.iloc[-1] / prices.iloc[-REVERSAL_LOOKBACK].replace(0, np.nan) - 1
+        reversal = -last_ret.reindex(avail)            # flip sign → losers score high
+    sr_rev = _sector_relative(reversal, avail, sector_map)
+
+    # ── Momentum composite (long-driving signal) ─────────────────────────
     momentum = (
         _rank(sr_12_1)   * 0.40   # core 12-1m momentum (dominant signal)
         + _rank(sr_resid)* 0.10   # market-adjusted residual (modest boost)
@@ -449,6 +486,20 @@ def compute_factors(
         + _rank(sr_3_1)  * 0.10   # 3-1m
         + _rank(sr_n52)  * 0.22   # nearness to 52-wk high
         - _rank(ivol_raw)* 0.05   # small IVOL penalty
+    )
+
+    # ── Blend reversal sleeve into the long signal ───────────────────────
+    if USE_REVERSAL:
+        momentum = (1 - REVERSAL_WEIGHT) * momentum + REVERSAL_WEIGHT * _rank(sr_rev)
+
+    # ── Dedicated SHORT-alpha score (Phase 3 #1) ─────────────────────────
+    # Shorts ranked by LOW momentum + HIGH idiosyncratic vol.
+    # Lower score = better short candidate.  This is independent of the long
+    # composite so the short book targets genuine underperformers, not just
+    # "whatever ranked last" among momentum names.
+    short_score = (
+        _rank(momentum)   * W_SHORT_MOM        # low momentum → low score
+        - _rank(ivol_raw) * W_SHORT_IVOL       # high IVOL → lowers score
     )
 
     # ── PIT fundamental blend (EDGAR, US stocks only) ────────────────────
@@ -496,15 +547,17 @@ def compute_factors(
         composite = momentum
 
     return pd.DataFrame({
-        "composite":  composite,
-        "quality":    quality,
-        "value":      value,
-        "momentum":   momentum,
-        "rvol":       rvol,
-        "ivol":       ivol_raw.reindex(avail).fillna(0.20),
-        "resid_mom":  resid_mom.reindex(avail).fillna(0.0),
-        "mom_12_1":   mom_12_1,
-        "near52":     near52.reindex(avail).fillna(0.5),
+        "composite":   composite,
+        "short_score": short_score.reindex(avail).fillna(0.0),
+        "quality":     quality,
+        "value":       value,
+        "momentum":    momentum,
+        "reversal":    sr_rev.reindex(avail).fillna(0.0),
+        "rvol":        rvol,
+        "ivol":        ivol_raw.reindex(avail).fillna(0.20),
+        "resid_mom":   resid_mom.reindex(avail).fillna(0.0),
+        "mom_12_1":    mom_12_1,
+        "near52":      near52.reindex(avail).fillna(0.5),
     }).reindex(avail)
 
 
@@ -649,22 +702,30 @@ def build_portfolio(
     long_pool  = comp.head(n_long * 3)
     long_picks = _sector_diversify(long_pool, n_long, sector_map)
 
-    # ── Shorts: bottom composite, with quality filter ─────────────────────
-    # Exclude deep-drawdown stocks (>35% below 52-wk high) — these are
-    # bounce candidates (value rotation, short-squeeze risk, M&A).
-    # Only short stocks in a GRADUAL downtrend, not ones that already crashed.
+    # ── Shorts: dedicated short-alpha score (Phase 3 #1) ──────────────────
+    # Rank by short_score (low momentum + high IVOL), NOT just bottom composite.
+    # Then apply the bounce/squeeze filter: exclude deep-drawdown crashes and
+    # stocks already strongly rising.
     near52   = factors["near52"]   if "near52"   in factors.columns else pd.Series(0.5, index=comp.index)
     mom_12_1 = factors["mom_12_1"] if "mom_12_1" in factors.columns else pd.Series(0.0, index=comp.index)
 
-    short_pool_raw = comp.tail(n_short * 3).iloc[::-1]   # worst composite first
-    # Filter: not too deep in drawdown, and actually declining
+    if USE_SHORT_SCORE and "short_score" in factors.columns:
+        ss = factors["short_score"].dropna()
+        ss = ss[ss.index != BENCHMARK]
+        if exclude_tickers:
+            ss = ss[~ss.index.isin(exclude_tickers)]
+        short_pool_raw = ss.sort_values(ascending=True).head(n_short * 3)  # lowest = best short
+    else:
+        # Phase-2 behaviour: shorts = bottom of the long composite
+        short_pool_raw = comp.tail(n_short * 3).iloc[::-1]   # worst composite first
+    # Filter: not too deep in drawdown (bounce risk), and not strongly rising
     not_crashed = near52.reindex(short_pool_raw.index).fillna(0.5) >= 0.62   # at most 38% below 52-wk high
     declining   = mom_12_1.reindex(short_pool_raw.index).fillna(0.0) <= 0.10  # not strongly rising
 
     short_pool  = short_pool_raw[not_crashed & declining]
 
     # Fallback: if filter removes too many, relax the drawdown threshold
-    if len(short_pool) < N_SHORT // 2:
+    if len(short_pool) < n_short // 2:
         relaxed   = near52.reindex(short_pool_raw.index).fillna(0.5) >= 0.50
         short_pool = short_pool_raw[relaxed & declining]
     if short_pool.empty:
@@ -1000,6 +1061,17 @@ def run_walkforward(start_year: int = 2019, force_refresh: bool = False) -> Dict
         spy_prices = prices_so_far[BENCHMARK].dropna() if BENCHMARK in prices_so_far else pd.Series()
         regime     = detect_regime(spy_prices)
         gross_mult = regime["gross_mult"]
+
+        # ── Volatility targeting (Phase 3 #3) ────────────────────────────
+        # Scale the book to a constant ex-ante vol using the strategy's own
+        # trailing realised vol.  Purely backward-looking → no lookahead.
+        vol_scalar = 1.0
+        if USE_VOL_TARGET and len(all_daily) >= VOL_LOOKBACK:
+            recent_vol = float(all_daily.iloc[-VOL_LOOKBACK:].std() * np.sqrt(252))
+            if recent_vol > 1e-6:
+                vol_scalar = float(np.clip(VOL_TARGET / recent_vol,
+                                           VOL_SCALE_MIN, VOL_SCALE_MAX))
+        gross_mult = gross_mult * vol_scalar
 
         # ── Signals ──────────────────────────────────────────────────────
         # Inject PIT fundamentals via sector_map dict (avoids signature change)
