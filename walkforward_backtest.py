@@ -84,8 +84,8 @@ REVERSAL_LOOKBACK = 21
 # Levering up into calm periods (max>1) amplified 2022/2025 crashes, so the
 # scalar is capped at 1.0 — this is a pure risk cap, not a vol target.
 USE_VOL_TARGET = True
-VOL_TARGET     = 0.08    # 8% annualised cap
-VOL_LOOKBACK   = 42      # trailing days for realised-vol estimate
+VOL_TARGET     = 0.05    # 5% annualised cap — optimum of the Phase 4 param sweep
+VOL_LOOKBACK   = 42      # trailing days for realised-vol estimate (21d/15d too noisy)
 VOL_SCALE_MIN  = 0.50    # de-lever down to at most 0.5×
 VOL_SCALE_MAX  = 1.00    # never lever above 1.0× (cap only)
 
