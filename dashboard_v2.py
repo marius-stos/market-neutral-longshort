@@ -130,15 +130,20 @@ def kpi_card(label: str, value: str, color: str = WHITE) -> dbc.Col:
 # ── App ───────────────────────────────────────────────────────────────────────
 
 app = Dash(__name__, external_stylesheets=[dbc.themes.DARKLY],
-           title="QVM Market-Neutral", suppress_callback_exceptions=True)
+           title="Momentum Market-Neutral", suppress_callback_exceptions=True)
 
 app.layout = dbc.Container(fluid=True,
     style={"backgroundColor": BG, "minHeight": "100vh", "padding": "24px"},
     children=[
         # ── Header ─────────────────────────────────────────────────────────
         dbc.Row([
-            dbc.Col(html.H3("⚡ Global QVM Market-Neutral Strategy",
-                            style={"color": WHITE, "fontWeight": 700})),
+            dbc.Col([
+                html.H3("⚡ Global Momentum Market-Neutral Strategy",
+                        style={"color": WHITE, "fontWeight": 700, "marginBottom": 2}),
+                html.Small("Sector-relative momentum · 39L/39S overlapping · "
+                           "regime filter + 5% volatility cap · dollar-neutral",
+                           style={"color": GREY}),
+            ]),
             dbc.Col(html.Small(id="ts-label", style={"color": GREY}),
                     width="auto", className="d-flex align-items-center"),
         ], className="mb-4"),
@@ -216,7 +221,8 @@ def build_live_section(sig: dict):
 
     s = sig["summary"]
     regime_label = s.get("regime", "—")
-    regime_color = {"Bull": GREEN, "Bear": RED, "Choppy": AMBER}.get(regime_label, WHITE)
+    regime_color = {"Bull": GREEN, "Bear": RED, "Choppy": AMBER,
+                    "Caution": AMBER, "Unknown": GREY}.get(regime_label, WHITE)
 
     live_kpis = dbc.Row([
         kpi_card("Regime",       regime_label,                         regime_color),
@@ -406,16 +412,27 @@ def refresh(_n):
     if rebal:
         df_r = pd.DataFrame(rebal)
         df_r["date"] = pd.to_datetime(df_r["date"])
-        clrs = {"Bull": GREEN, "Choppy": AMBER, "Bear": RED}
-        fig_regime = go.Figure(layout={**BASE_LAYOUT, "title": {"text": "Regime & Gross Exposure"}})
+        # Effective gross = raw gross × (regime × vol-cap multiplier). Falls back
+        # to raw gross for older result files without the field.
+        gcol = "effective_gross" if "effective_gross" in df_r.columns else "gross"
+        clrs = {"Bull": GREEN, "Choppy": AMBER, "Caution": AMBER,
+                "Bear": RED, "Unknown": GREY}
+        fig_regime = go.Figure(layout={**BASE_LAYOUT,
+                                       "title": {"text": "Regime & Effective Gross (incl. vol cap)"}})
+        # Continuous grey line so the de-grossing trajectory is visible…
+        fig_regime.add_trace(go.Scatter(
+            x=df_r["date"], y=df_r[gcol], mode="lines",
+            line=dict(color=GREY, width=1), name="Effective gross",
+            showlegend=False, hoverinfo="skip",
+        ))
+        # …then colour the markers by regime
         for lbl, grp in df_r.groupby("regime"):
             fig_regime.add_trace(go.Scatter(
-                x=grp["date"], y=grp["gross"],
-                mode="markers+lines", name=lbl,
-                line=dict(color=clrs.get(lbl, GREY), width=1.8),
-                marker=dict(size=7),
+                x=grp["date"], y=grp[gcol],
+                mode="markers", name=lbl,
+                marker=dict(size=7, color=clrs.get(lbl, GREY)),
             ))
-        fig_regime.update_yaxes(title="Gross Exposure")
+        fig_regime.update_yaxes(title="Deployed gross exposure")
 
     # ── Trade scatter ─────────────────────────────────────────────────────────
     fig_scatter = empty_fig("No trades")

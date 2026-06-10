@@ -1213,13 +1213,16 @@ def run_walkforward(start_year: int = 2019, force_refresh: bool = False) -> Dict
             top_longs, top_shorts = [], []
 
         rebal_history.append({
-            "date":        str(rdate.date()),
-            "regime":      regime["label"],
-            "n_long":      int(n_long_tot),
-            "n_short":     int(n_short_tot),
-            "gross":       round(gross_tot, 3),
-            "top_longs":   top_longs,
-            "top_shorts":  top_shorts,
+            "date":            str(rdate.date()),
+            "regime":          regime["label"],
+            "n_long":          int(n_long_tot),
+            "n_short":         int(n_short_tot),
+            "gross":           round(gross_tot, 3),                 # raw gross (pre-scaling)
+            "gross_mult":      round(float(gross_mult), 3),          # regime × vol cap multiplier
+            "effective_gross": round(gross_tot * float(gross_mult), 3),  # actually-deployed exposure
+            "vol_scalar":      round(float(vol_scalar), 3),
+            "top_longs":       top_longs,
+            "top_shorts":      top_shorts,
         })
 
     if all_daily.empty:

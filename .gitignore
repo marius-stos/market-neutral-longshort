@@ -28,6 +28,14 @@ output/*.parquet
 !output/live_signals.json
 !output/deals.json
 
+# Secrets — API keys, never commit
+.env
+.env.*
+*.key
+
+# M&A project files (belong in the merger-arbitrage repo)
+deal_scraper.py
+
 # OS
 .DS_Store
 Thumbs.db
